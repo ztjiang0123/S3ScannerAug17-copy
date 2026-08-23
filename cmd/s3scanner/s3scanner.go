@@ -152,33 +152,12 @@ func Run(version string) {
 		log.SetFormatter(&log.TextFormatter{DisableTimestamp: true})
 	}
 
-	var p provider.StorageProvider
-	var err error
 	configErr := validateConfig(args)
 	if configErr != nil {
 		log.Error(configErr)
 		os.Exit(1)
 	}
-	if args.ProviderFlag == "custom" {
-		if viper.IsSet("providers.custom") {
-			log.Debug("found custom provider")
-			p, err = provider.NewCustomProvider(
-				viper.GetString("providers.custom.address_style"),
-				viper.GetBool("providers.custom.insecure"),
-				viper.GetStringSlice("providers.custom.regions"),
-				viper.GetString("providers.custom.endpoint_format"))
-			if err != nil {
-				log.Error(err)
-				os.Exit(1)
-			}
-		}
-	} else {
-		p, err = provider.NewProvider(args.ProviderFlag)
-		if err != nil {
-			log.Error(err)
-			os.Exit(1)
-		}
-	}
+	p := setupProvider(args.ProviderFlag)
 
 	// Setup database connection
 	if args.WriteToDB {
@@ -194,30 +173,7 @@ func Run(version string) {
 	var wg sync.WaitGroup
 
 	if !args.UseMq {
-		buckets := make(chan bucket.Bucket)
-
-		for i := 0; i < args.Threads; i++ {
-			wg.Add(1)
-			go worker.Work(&wg, buckets, p, args.DoEnumerate, args.WriteToDB, args.JSON)
-		}
-
-		if args.BucketFile != "" {
-			err := bucket.ReadFromFile(args.BucketFile, buckets)
-			close(buckets)
-			if err != nil {
-				log.Error(err)
-				os.Exit(1)
-			}
-		} else if args.BucketName != "" {
-			if !bucket.IsValidS3BucketName(args.BucketName) {
-				log.Info(fmt.Sprintf("invalid   | %s", args.BucketName))
-				os.Exit(0)
-			}
-			c := bucket.NewBucket(strings.ToLower(args.BucketName))
-			buckets <- c
-			close(buckets)
-		}
-
+		scanFromArgs(&wg, p)
 		wg.Wait()
 		os.Exit(0)
 	}
@@ -245,4 +201,69 @@ func Run(version string) {
 	}
 	log.Printf("Waiting for messages. To exit press CTRL+C")
 	wg.Wait()
+}
+
+// scanFromArgs spins up the worker pool and feeds it buckets from either the
+// bucket file or the single bucket name provided on the command line.
+func scanFromArgs(wg *sync.WaitGroup, p provider.StorageProvider) {
+	buckets := make(chan bucket.Bucket)
+
+	for i := 0; i < args.Threads; i++ {
+		wg.Add(1)
+		go worker.Work(wg, buckets, p, args.DoEnumerate, args.WriteToDB, args.JSON)
+	}
+
+	if args.BucketFile != "" {
+		err := bucket.ReadFromFile(args.BucketFile, buckets)
+		close(buckets)
+		if err != nil {
+			log.Error(err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if args.BucketName != "" {
+		feedBucketName(buckets, args.BucketName)
+	}
+}
+
+// feedBucketName validates a single bucket name and sends it to the workers,
+// then closes the channel.
+func feedBucketName(buckets chan bucket.Bucket, name string) {
+	if !bucket.IsValidS3BucketName(name) {
+		log.Info(fmt.Sprintf("invalid   | %s", name))
+		os.Exit(0)
+	}
+	buckets <- bucket.NewBucket(strings.ToLower(name))
+	close(buckets)
+}
+
+// setupProvider builds the storage provider for the given provider flag,
+// exiting the process on any construction error.
+func setupProvider(providerFlag string) provider.StorageProvider {
+	if providerFlag != "custom" {
+		p, err := provider.NewProvider(providerFlag)
+		if err != nil {
+			log.Error(err)
+			os.Exit(1)
+		}
+		return p
+	}
+
+	if !viper.IsSet("providers.custom") {
+		return nil
+	}
+
+	log.Debug("found custom provider")
+	p, err := provider.NewCustomProvider(
+		viper.GetString("providers.custom.address_style"),
+		viper.GetBool("providers.custom.insecure"),
+		viper.GetStringSlice("providers.custom.regions"),
+		viper.GetString("providers.custom.endpoint_format"))
+	if err != nil {
+		log.Error(err)
+		os.Exit(1)
+	}
+	return p
 }
