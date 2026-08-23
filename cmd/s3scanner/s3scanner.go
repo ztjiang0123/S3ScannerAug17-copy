@@ -152,33 +152,12 @@ func Run(version string) {
 		log.SetFormatter(&log.TextFormatter{DisableTimestamp: true})
 	}
 
-	var p provider.StorageProvider
-	var err error
 	configErr := validateConfig(args)
 	if configErr != nil {
 		log.Error(configErr)
 		os.Exit(1)
 	}
-	if args.ProviderFlag == "custom" {
-		if viper.IsSet("providers.custom") {
-			log.Debug("found custom provider")
-			p, err = provider.NewCustomProvider(
-				viper.GetString("providers.custom.address_style"),
-				viper.GetBool("providers.custom.insecure"),
-				viper.GetStringSlice("providers.custom.regions"),
-				viper.GetString("providers.custom.endpoint_format"))
-			if err != nil {
-				log.Error(err)
-				os.Exit(1)
-			}
-		}
-	} else {
-		p, err = provider.NewProvider(args.ProviderFlag)
-		if err != nil {
-			log.Error(err)
-			os.Exit(1)
-		}
-	}
+	p := setupProvider(args.ProviderFlag)
 
 	// Setup database connection
 	if args.WriteToDB {
@@ -245,4 +224,33 @@ func Run(version string) {
 	}
 	log.Printf("Waiting for messages. To exit press CTRL+C")
 	wg.Wait()
+}
+
+// setupProvider builds the storage provider for the given provider flag,
+// exiting the process on any construction error.
+func setupProvider(providerFlag string) provider.StorageProvider {
+	if providerFlag != "custom" {
+		p, err := provider.NewProvider(providerFlag)
+		if err != nil {
+			log.Error(err)
+			os.Exit(1)
+		}
+		return p
+	}
+
+	if !viper.IsSet("providers.custom") {
+		return nil
+	}
+
+	log.Debug("found custom provider")
+	p, err := provider.NewCustomProvider(
+		viper.GetString("providers.custom.address_style"),
+		viper.GetBool("providers.custom.insecure"),
+		viper.GetStringSlice("providers.custom.regions"),
+		viper.GetString("providers.custom.endpoint_format"))
+	if err != nil {
+		log.Error(err)
+		os.Exit(1)
+	}
+	return p
 }
