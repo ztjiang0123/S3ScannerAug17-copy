@@ -2,18 +2,17 @@ package provider
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"net/http"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/sa7mon/s3scanner/bucket"
 	"github.com/sa7mon/s3scanner/provider/clientmap"
-	"net/http"
 )
 
 type Wasabi struct {
-	clients      *clientmap.ClientMap
+	simpleProvider
 	existsClient *s3.Client
 }
 
@@ -31,35 +30,17 @@ func (w *Wasabi) BucketExists(b *bucket.Bucket) (*bucket.Bucket, error) {
 	if err != nil {
 		return b, err
 	}
-	if exists {
-		b.Exists = bucket.BucketExists
-		b.Region = region
-	} else {
-		b.Exists = bucket.BucketNotExist
-	}
-
+	applyExistsResult(b, exists, region)
 	return b, nil
 }
 
 func (w *Wasabi) Scan(bucket *bucket.Bucket, doDestructiveChecks bool) error {
-	client := w.clients.Get(bucket.Region, false)
+	client := w.getRegionClient(bucket.Region)
 	return checkPermissions(client, bucket, doDestructiveChecks)
 }
 
 func (w *Wasabi) Enumerate(b *bucket.Bucket) error {
-	if b.Exists != bucket.BucketExists {
-		return errors.New("bucket might not exist")
-	}
-	client := w.getRegionClient(b.Region)
-	enumErr := enumerateListObjectsV2(client, b)
-	if enumErr != nil {
-		return enumErr
-	}
-	return nil
-}
-
-func (w *Wasabi) getRegionClient(region string) *s3.Client {
-	return w.clients.Get(region, false)
+	return enumerateBucket(w.getRegionClient, b)
 }
 
 func (w *Wasabi) newExistsClient() (*s3.Client, error) {
@@ -86,12 +67,10 @@ func (w *Wasabi) newExistsClient() (*s3.Client, error) {
 }
 
 func NewProviderWasabi() (*Wasabi, error) {
-	w := new(Wasabi)
-	clients, err := w.newClients()
+	w, err := newSimpleProvider(new(Wasabi))
 	if err != nil {
 		return w, err
 	}
-	w.clients = clients
 
 	c, cErr := w.newExistsClient()
 	if cErr != nil {
@@ -102,16 +81,9 @@ func NewProviderWasabi() (*Wasabi, error) {
 }
 
 func (w *Wasabi) newClients() (*clientmap.ClientMap, error) {
-	clients := clientmap.WithCapacity(len(ProviderRegions[w.Name()]))
-	for _, r := range ProviderRegions[w.Name()] {
-		client, err := newNonAWSClient(w, fmt.Sprintf("https://s3.%s.wasabisys.com", r))
-		if err != nil {
-			return nil, err
-		}
-		clients.Set(r, false, client)
-	}
-
-	return clients, nil
+	return buildClients(w,
+		func() []string { return ProviderRegions[w.Name()] },
+		endpointFormatter("https://s3.%s.wasabisys.com"))
 }
 
 func (w *Wasabi) Name() string { return "wasabi" }
