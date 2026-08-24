@@ -211,62 +211,79 @@ func checkPermissions(client *s3.Client, b *bucket.Bucket, doDestructiveChecks b
 	return nil
 }
 
+// probeBucketRegion issues the existence probe for b against a single region's
+// client and returns the raw error (nil means the bucket exists in that region).
+func probeBucketRegion(client *s3.Client, b *bucket.Bucket) error {
+	// Unlike other APIs, Scaleway returns '200 OK' to a HEAD request sent to the wrong region for a
+	// bucket that does exist in another region. So instead, we send a GET request for a list of 1 object.
+	// Scaleway will return 404 to the GET request in any region other than the one the bucket belongs to.
+	// See https://github.com/sa7mon/S3Scanner/issues/209 for a better way to fix this.
+	if b.Provider == "scaleway" {
+		_, err := client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+			Bucket:  &b.Name,
+			MaxKeys: aws.Int32(1),
+		})
+		return err
+	}
+	_, err := manager.GetBucketRegion(context.TODO(), client, b.Name)
+	return err
+}
+
+// classifyRegionProbe maps the error returned by probeBucketRegion into a
+// definitive result. It returns a bucketCheckResult when the error is one of the
+// known "does/doesn't exist" signals, or a non-nil error when the outcome could
+// not be determined and the caller should abort.
+func classifyRegionProbe(region string, probeErr error, logFields log.Fields) (bucketCheckResult, error) {
+	if probeErr == nil {
+		log.WithFields(logFields).Debugf("no error - bucket exists")
+		return bucketCheckResult{region: region, exists: true}, nil
+	}
+
+	var bnf manager.BucketNotFound // Can be returned from GetBucketRegion()
+	var nsb *types.NoSuchBucket    // Can be returned from ListObjectsV2()
+	var re2 *awshttp.ResponseError
+
+	bucketNotFound := errors.As(probeErr, &bnf) || errors.As(probeErr, &nsb)
+	if bucketNotFound {
+		log.WithFields(logFields).Debugf("BucketNotFound")
+		return bucketCheckResult{region: region, exists: false}, nil
+	}
+
+	if errors.As(probeErr, &re2) && re2.HTTPStatusCode() == 403 {
+		log.WithFields(logFields).Debugf("AccessDenied")
+		return bucketCheckResult{region: region, exists: true}, nil
+	}
+
+	// Unhandled error. If probeErr is a ResponseError, only return the unwrapped
+	// error i.e. "Method Not Allowed"; otherwise return the whole error.
+	err := probeErr
+	if errors.As(probeErr, &re2) {
+		err = re2.Unwrap()
+	}
+	log.WithFields(logFields).Debug(fmt.Errorf("unhandled error: %w", probeErr))
+	return bucketCheckResult{}, err
+}
+
 // bucketExists takes a bucket name and checks if it exists in any region contained in clients
 func bucketExists(clients *clientmap.ClientMap, b *bucket.Bucket) (bool, string, error) {
 	results := make(chan bucketCheckResult, clients.Len())
 	e := make(chan error, 1)
 
 	clients.Each(func(region string, _ bool, client *s3.Client) {
-		go func(bucketName string, client *s3.Client, region string) {
+		go func(client *s3.Client, region string) {
 			logFields := log.Fields{
 				"bucket_name": b.Name,
 				"region":      region,
 				"method":      "providers.bucketExists()",
 			}
-			var regionErr error
 
-			// Unlike other APIs, Scaleway returns '200 OK' to a HEAD request sent to the wrong region for a
-			// bucket that does exist in another region. So instead, we send a GET request for a list of 1 object.
-			// Scaleway will return 404 to the GET request in any region other than the one the bucket belongs to.
-			// See https://github.com/sa7mon/S3Scanner/issues/209 for a better way to fix this.
-			if b.Provider == "scaleway" {
-				_, regionErr = client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
-					Bucket:  &b.Name,
-					MaxKeys: aws.Int32(1),
-				})
-			} else {
-				_, regionErr = manager.GetBucketRegion(context.TODO(), client, bucketName)
-			}
-
-			if regionErr == nil {
-				log.WithFields(logFields).Debugf("no error - bucket exists")
-				results <- bucketCheckResult{region: region, exists: true}
+			result, classifyErr := classifyRegionProbe(region, probeBucketRegion(client, b), logFields)
+			if classifyErr != nil {
+				e <- classifyErr
 				return
 			}
-
-			var bnf manager.BucketNotFound // Can be returned from GetBucketRegion()
-			var nsb *types.NoSuchBucket    // Can be returned from ListObjectsV2()
-			var re2 *awshttp.ResponseError
-			if errors.As(regionErr, &bnf) {
-				log.WithFields(logFields).Debugf("BucketNotFound")
-				results <- bucketCheckResult{region: region, exists: false}
-			} else if errors.As(regionErr, &nsb) {
-				log.WithFields(logFields).Debugf("BucketNotFound")
-				results <- bucketCheckResult{region: region, exists: false}
-			} else if errors.As(regionErr, &re2) && re2.HTTPStatusCode() == 403 {
-				log.WithFields(logFields).Debugf("AccessDenied")
-				results <- bucketCheckResult{region: region, exists: true}
-			} else {
-				// If regionErr is a ResponseError, only return the unwrapped error i.e. "Method Not Allowed"
-				// Otherwise, return the whole error
-				err := regionErr
-				if errors.As(regionErr, &re2) {
-					err = re2.Unwrap()
-				}
-				log.WithFields(logFields).Debug(fmt.Errorf("unhandled error: %w", regionErr))
-				e <- err
-			}
-		}(b.Name, client, region)
+			results <- result
+		}(client, region)
 	})
 
 	for i := 0; i < clients.Len(); i++ {

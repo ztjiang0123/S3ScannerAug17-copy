@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/sa7mon/s3scanner/bucket"
 	"github.com/sa7mon/s3scanner/provider/clientmap"
 )
 
 type CustomProvider struct {
+	simpleProvider
 	regions        []string
-	clients        *clientmap.ClientMap
 	insecure       bool
 	addressStyle   int
 	endpointFormat string
@@ -31,19 +30,7 @@ func (CustomProvider) Name() string {
 }
 
 func (cp CustomProvider) BucketExists(b *bucket.Bucket) (*bucket.Bucket, error) {
-	b.Provider = cp.Name()
-	exists, region, err := bucketExists(cp.clients, b)
-	if err != nil {
-		return b, err
-	}
-	if exists {
-		b.Exists = bucket.BucketExists
-		b.Region = region
-	} else {
-		b.Exists = bucket.BucketNotExist
-	}
-
-	return b, nil
+	return checkBucketExists(cp.clients, cp.Name(), b)
 }
 
 func (cp CustomProvider) Scan(b *bucket.Bucket, doDestructiveChecks bool) error {
@@ -58,17 +45,7 @@ func (cp CustomProvider) Enumerate(b *bucket.Bucket) error {
 	if b.PermAllUsersRead != bucket.PermissionAllowed {
 		return nil
 	}
-
-	client := cp.getRegionClient(b.Region)
-	enumErr := enumerateListObjectsV2(client, b)
-	if enumErr != nil {
-		return enumErr
-	}
-	return nil
-}
-
-func (cp *CustomProvider) getRegionClient(region string) *s3.Client {
-	return cp.clients.Get(region, false)
+	return enumerateListObjectsV2(cp.getRegionClient(b.Region), b)
 }
 
 /*
@@ -89,24 +66,13 @@ func NewCustomProvider(addressStyle string, insecure bool, regions []string, end
 		return cp, fmt.Errorf("unknown custom provider address style: %s. Expected 'path' or 'vhost'", addressStyle)
 	}
 
-	clients, err := cp.newClients()
-	if err != nil {
-		return nil, err
-	}
-	cp.clients = clients
-	return cp, nil
+	return newSimpleProvider(cp)
 }
 
 func (cp *CustomProvider) newClients() (*clientmap.ClientMap, error) {
-	clients := clientmap.WithCapacity(len(cp.regions))
-	for _, r := range cp.regions {
-		regionURL := strings.ReplaceAll(cp.endpointFormat, "$REGION", r)
-		client, err := newNonAWSClient(cp, regionURL)
-		if err != nil {
-			return nil, err
-		}
-		clients.Set(r, false, client)
-	}
-
-	return clients, nil
+	return buildClients(cp,
+		func() []string { return cp.regions },
+		func(region string) string {
+			return strings.ReplaceAll(cp.endpointFormat, "$REGION", region)
+		})
 }
