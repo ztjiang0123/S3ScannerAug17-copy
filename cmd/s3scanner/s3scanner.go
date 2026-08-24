@@ -208,9 +208,15 @@ func Run(version string) {
 func scanFromArgs(wg *sync.WaitGroup, p provider.StorageProvider) {
 	buckets := make(chan bucket.Bucket)
 
+	workConfig := worker.Config{
+		Provider:    p,
+		DoEnumerate: args.DoEnumerate,
+		WriteToDB:   args.WriteToDB,
+		JSON:        args.JSON,
+	}
 	for i := 0; i < args.Threads; i++ {
 		wg.Add(1)
-		go worker.Work(wg, buckets, p, args.DoEnumerate, args.WriteToDB, args.JSON)
+		go worker.Work(wg, buckets, workConfig)
 	}
 
 	if args.BucketFile != "" {
